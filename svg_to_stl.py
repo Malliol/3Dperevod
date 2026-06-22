@@ -130,7 +130,7 @@ def make_base_plate(all_geoms, thickness=BASE_HEIGHT):
         (maxx + margin, maxy + margin),
         (minx - margin, maxy + margin),
     ])
-    return extrude_polygon(plate, thickness)
+    return extrude_polygon(plate, thickness, engine="earcut")
 
 
 def extrude(geom, height, z_offset=0.0):
@@ -158,7 +158,7 @@ def extrude(geom, height, z_offset=0.0):
         if poly.is_empty or poly.area < 1e-6:
             continue
         try:
-            m = extrude_polygon(poly, height)
+            m = extrude_polygon(poly, height, engine="earcut")
             m.apply_translation([0, 0, z_offset])
             meshes.append(m)
         except Exception as e:
