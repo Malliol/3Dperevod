@@ -1,247 +1,242 @@
 #!/usr/bin/env python3
 """
 SVG City Map to STL converter.
-Extrudes roads and buildings from an SVG map into a 3D STL file.
+No trimesh triangulation engine required — mesh is built manually.
 
 Usage:
-    pip install svgpathtools numpy shapely trimesh
+    pip install svgpathtools numpy shapely
     python svg_to_stl.py input.svg output.stl
-
-Layer detection uses SVG element id/class/fill:
-  - Buildings: id/class containing 'building', 'house', 'block', 'здание'
-  - Roads:     id/class containing 'road', 'street', 'way', 'дорог', 'улиц'
-  - Base:      everything else (parks, water, etc.)
 """
 
 import sys
 import re
+import struct
 import argparse
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
 
 try:
-    from svgpathtools import svg2paths2, Path as SvgPath, Line, CubicBezier, QuadraticBezier, Arc
+    from svgpathtools import svg2paths2, Line, CubicBezier, QuadraticBezier, Arc
 except ImportError:
-    sys.exit("Install svgpathtools:  pip install svgpathtools")
+    sys.exit("Run:  pip install svgpathtools")
 
 try:
     from shapely.geometry import Polygon, MultiPolygon, LineString
     from shapely.ops import unary_union
-    import shapely.errors
+    from shapely.validation import make_valid
 except ImportError:
-    sys.exit("Install shapely:  pip install shapely")
+    sys.exit("Run:  pip install shapely")
 
 try:
-    import trimesh
-    from trimesh.creation import extrude_polygon
+    import numpy as np
 except ImportError:
-    sys.exit("Install trimesh:  pip install trimesh")
+    sys.exit("Run:  pip install numpy")
 
 
-# ── Extrusion heights (mm) ─────────────────────────────────────────────────
-BASE_HEIGHT      = 1.0   # ground plate
-ROAD_HEIGHT      = 0.5   # roads sit slightly above base
-BUILDING_HEIGHT  = 5.0   # default building height
-OTHER_HEIGHT     = 0.2   # parks, water, etc. — barely raised
-
-# ── Road stroke width → polygon expansion (mm in SVG units) ───────────────
-ROAD_BUFFER      = 3.0   # half-width added around road centre-lines
-
-SAMPLES_PER_CURVE = 32   # bezier/arc sampling resolution
+# ── Heights (mm / SVG units) ───────────────────────────────────────────────
+BASE_HEIGHT     = 1.0
+ROAD_HEIGHT     = 0.8
+BUILDING_HEIGHT = 5.0
+OTHER_HEIGHT    = 0.3
+ROAD_BUFFER     = 3.0
+SAMPLES         = 32
 
 
-# ──────────────────────────────────────────────────────────────────────────
-def classify(attrs: dict) -> str:
-    """Return 'building', 'road', or 'other' based on element attributes."""
+# ── Classify SVG element ───────────────────────────────────────────────────
+def classify(attrs):
     text = " ".join([
-        attrs.get("id", ""),
-        attrs.get("class", ""),
-        attrs.get("inkscape:label", ""),
-        attrs.get("fill", ""),
-        attrs.get("stroke", ""),
+        attrs.get("id", ""), attrs.get("class", ""),
+        attrs.get("inkscape:label", ""), attrs.get("fill", ""),
     ]).lower()
-
-    building_kw = ("building", "house", "block", "здани", "дом", "квартал")
-    road_kw     = ("road", "street", "way", "highway", "дорог", "улиц", "шоссе", "проспект")
-
-    if any(k in text for k in building_kw):
+    if any(k in text for k in ("building","house","block","здани","дом","квартал")):
         return "building"
-    if any(k in text for k in road_kw):
+    if any(k in text for k in ("road","street","way","highway","дорог","улиц","шоссе")):
         return "road"
     return "other"
 
 
-def svg_path_to_coords(path, n=SAMPLES_PER_CURVE):
-    """Sample an svgpathtools Path into a list of (x, y) tuples."""
+# ── SVG path → coordinate list ─────────────────────────────────────────────
+def path_to_coords(path):
     coords = []
     for seg in path:
         if isinstance(seg, Line):
             coords.append((seg.start.real, seg.start.imag))
         else:
-            for i in range(n):
-                t = i / n
-                pt = seg.point(t)
+            for i in range(SAMPLES):
+                pt = seg.point(i / SAMPLES)
                 coords.append((pt.real, pt.imag))
     if path:
-        end = path[-1].end
-        coords.append((end.real, end.imag))
+        e = path[-1].end
+        coords.append((e.real, e.imag))
     return coords
 
 
-def coords_to_shapely(coords):
-    """Convert coordinate list to a Shapely geometry (Polygon or LineString)."""
+def to_shapely(coords):
     if len(coords) < 2:
         return None
-    # closed path → polygon
     if len(coords) >= 3 and np.allclose(coords[0], coords[-1], atol=1e-3):
         try:
-            poly = Polygon(coords)
-            if poly.is_valid and poly.area > 1e-6:
-                return poly
-            poly = poly.buffer(0)
-            if not poly.is_empty:
-                return poly
+            p = make_valid(Polygon(coords))
+            return p if not p.is_empty else None
         except Exception:
             pass
     return LineString(coords)
 
 
-def flip_y(geom, height):
-    """SVG Y-axis points down; flip it for standard 3D coordinates."""
-    if geom is None:
-        return None
+def flip_y(geom, h):
     from shapely.affinity import scale
-    return scale(geom, yfact=-1, origin=(0, height / 2, 0))
+    return scale(geom, yfact=-1, origin=(0, h / 2, 0))
 
 
-def make_base_plate(all_geoms, thickness=BASE_HEIGHT):
-    """Create a rectangular base under the whole model."""
-    from shapely.ops import unary_union
-    combined = unary_union([g for g in all_geoms if g is not None and not g.is_empty])
-    if combined.is_empty:
-        return None
-    minx, miny, maxx, maxy = combined.bounds
-    margin = 5
-    plate = Polygon([
-        (minx - margin, miny - margin),
-        (maxx + margin, miny - margin),
-        (maxx + margin, maxy + margin),
-        (minx - margin, maxy + margin),
-    ])
-    return extrude_polygon(plate, thickness, engine="earcut")
+# ── Manual STL mesh builder ────────────────────────────────────────────────
+class MeshBuilder:
+    def __init__(self):
+        self.triangles = []  # list of (3,3) arrays
+
+    def add_quad(self, a, b, c, d):
+        """Add two triangles forming a quad (a,b,c,d in order)."""
+        self.triangles.append(np.array([a, b, c]))
+        self.triangles.append(np.array([a, c, d]))
+
+    def add_polygon_cap(self, ring, z, flip=False):
+        """Fan-triangulate a flat polygon ring at height z."""
+        pts = [(x, y) for x, y in ring]
+        if len(pts) < 3:
+            return
+        # remove duplicate closing point
+        if np.allclose(pts[0], pts[-1]):
+            pts = pts[:-1]
+        if len(pts) < 3:
+            return
+        o = np.array([pts[0][0], pts[0][1], z])
+        for i in range(1, len(pts) - 1):
+            a = np.array([pts[i][0],   pts[i][1],   z])
+            b = np.array([pts[i+1][0], pts[i+1][1], z])
+            tri = [o, a, b] if not flip else [o, b, a]
+            self.triangles.append(np.array(tri))
+
+    def add_walls(self, ring, z_bot, z_top):
+        """Extrude the edges of a ring into vertical walls."""
+        pts = list(ring)
+        if np.allclose(pts[0], pts[-1]):
+            pts = pts[:-1]
+        n = len(pts)
+        for i in range(n):
+            x0, y0 = pts[i]
+            x1, y1 = pts[(i+1) % n]
+            bl = np.array([x0, y0, z_bot])
+            br = np.array([x1, y1, z_bot])
+            tr = np.array([x1, y1, z_top])
+            tl = np.array([x0, y0, z_top])
+            self.add_quad(bl, br, tr, tl)
+
+    def extrude_poly(self, poly, z_bot, z_top):
+        ring = list(poly.exterior.coords)
+        self.add_polygon_cap(ring, z_bot, flip=True)
+        self.add_polygon_cap(ring, z_top, flip=False)
+        self.add_walls(ring, z_bot, z_top)
+        for interior in poly.interiors:
+            ir = list(interior.coords)
+            self.add_polygon_cap(ir, z_bot, flip=False)
+            self.add_polygon_cap(ir, z_top, flip=True)
+            self.add_walls(ir, z_bot, z_top)
+
+    def extrude_geom(self, geom, z_bot, z_top):
+        if geom is None or geom.is_empty:
+            return
+        if isinstance(geom, Polygon):
+            self.extrude_poly(geom, z_bot, z_top)
+        elif isinstance(geom, MultiPolygon):
+            for p in geom.geoms:
+                self.extrude_poly(p, z_bot, z_top)
+        elif isinstance(geom, LineString):
+            self.extrude_geom(geom.buffer(ROAD_BUFFER), z_bot, z_top)
+        else:
+            for g in geom.geoms:
+                self.extrude_geom(g, z_bot, z_top)
+
+    def write_stl(self, path):
+        tris = self.triangles
+        print(f"Writing {len(tris)} triangles to {path} …")
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 80)
+            f.write(struct.pack("<I", len(tris)))
+            for tri in tris:
+                v0, v1, v2 = tri
+                n = np.cross(v1 - v0, v2 - v0)
+                nn = np.linalg.norm(n)
+                n = n / nn if nn > 1e-10 else n
+                f.write(struct.pack("<fff", *n))
+                f.write(struct.pack("<fff", *v0))
+                f.write(struct.pack("<fff", *v1))
+                f.write(struct.pack("<fff", *v2))
+                f.write(b"\x00\x00")
+        print("Done!")
 
 
-def extrude(geom, height, z_offset=0.0):
-    """Extrude a Shapely geometry to a trimesh mesh at z_offset."""
-    meshes = []
-    if geom is None or geom.is_empty:
-        return None
-
-    polys = []
-    if isinstance(geom, Polygon):
-        polys = [geom]
-    elif isinstance(geom, MultiPolygon):
-        polys = list(geom.geoms)
-    elif isinstance(geom, LineString):
-        polys = [geom.buffer(ROAD_BUFFER)]
-    else:
-        # GeometryCollection or other
-        for g in geom.geoms:
-            m = extrude(g, height, z_offset)
-            if m is not None:
-                meshes.append(m)
-        return trimesh.util.concatenate(meshes) if meshes else None
-
-    for poly in polys:
-        if poly.is_empty or poly.area < 1e-6:
-            continue
-        try:
-            m = extrude_polygon(poly, height, engine="earcut")
-            m.apply_translation([0, 0, z_offset])
-            meshes.append(m)
-        except Exception as e:
-            print(f"  [warn] extrude failed: {e}")
-
-    return trimesh.util.concatenate(meshes) if meshes else None
-
-
-# ──────────────────────────────────────────────────────────────────────────
-def convert(svg_path: str, stl_path: str):
+# ── Main conversion ────────────────────────────────────────────────────────
+def convert(svg_path, stl_path):
     print(f"Reading {svg_path} …")
     paths, attributes, svg_attrs = svg2paths2(svg_path)
 
-    # Get SVG viewport height for Y-flip
     vb = svg_attrs.get("viewBox", "")
     try:
         parts = [float(x) for x in re.split(r"[\s,]+", vb.strip())]
-        svg_height = parts[3]
+        svg_h = parts[3]
     except Exception:
-        svg_height = float(svg_attrs.get("height", "500").replace("px", ""))
+        svg_h = float(re.sub(r"[^\d.]", "", svg_attrs.get("height", "500")) or 500)
 
     buckets = {"building": [], "road": [], "other": []}
-
     for path, attrs in zip(paths, attributes):
-        kind = classify(attrs)
-        coords = svg_path_to_coords(path)
-        geom = coords_to_shapely(coords)
+        coords = path_to_coords(path)
+        geom = to_shapely(coords)
         if geom is None:
             continue
-        geom = flip_y(geom, svg_height)
-        buckets[kind].append(geom)
+        geom = flip_y(geom, svg_h)
+        buckets[classify(attrs)].append(geom)
 
     print(f"  buildings: {len(buckets['building'])}, "
           f"roads: {len(buckets['road'])}, "
           f"other: {len(buckets['other'])}")
 
     all_geoms = buckets["building"] + buckets["road"] + buckets["other"]
-    meshes = []
+    if not all_geoms:
+        sys.exit("No geometry found in SVG.")
 
-    # Base plate
-    base = make_base_plate(all_geoms, BASE_HEIGHT)
-    if base:
-        meshes.append(base)
+    combined = unary_union([g for g in all_geoms if not g.is_empty])
+    minx, miny, maxx, maxy = combined.bounds
+    m = 5
+    base_poly = Polygon([
+        (minx-m, miny-m), (maxx+m, miny-m),
+        (maxx+m, maxy+m), (minx-m, maxy+m),
+    ])
 
-    # Roads
+    builder = MeshBuilder()
+    builder.extrude_geom(base_poly, 0, BASE_HEIGHT)
+
     for geom in buckets["road"]:
-        m = extrude(geom, ROAD_HEIGHT, z_offset=BASE_HEIGHT)
-        if m:
-            meshes.append(m)
+        builder.extrude_geom(geom, BASE_HEIGHT, BASE_HEIGHT + ROAD_HEIGHT)
 
-    # Buildings
     for geom in buckets["building"]:
-        m = extrude(geom, BUILDING_HEIGHT, z_offset=BASE_HEIGHT)
-        if m:
-            meshes.append(m)
+        builder.extrude_geom(geom, BASE_HEIGHT, BASE_HEIGHT + BUILDING_HEIGHT)
 
-    # Other (parks, water)
     for geom in buckets["other"]:
-        m = extrude(geom, OTHER_HEIGHT, z_offset=BASE_HEIGHT)
-        if m:
-            meshes.append(m)
+        builder.extrude_geom(geom, BASE_HEIGHT, BASE_HEIGHT + OTHER_HEIGHT)
 
-    if not meshes:
-        sys.exit("No geometry found — check that SVG contains filled paths/polygons.")
-
-    print("Merging meshes …")
-    result = trimesh.util.concatenate(meshes)
-
-    print(f"Exporting to {stl_path} …")
-    result.export(stl_path)
-    print(f"Done! Vertices: {len(result.vertices)}, Faces: {len(result.faces)}")
+    builder.write_stl(stl_path)
 
 
 def main():
-    global ROAD_BUFFER, BUILDING_HEIGHT, ROAD_HEIGHT, BASE_HEIGHT
+    global ROAD_BUFFER, BUILDING_HEIGHT, ROAD_HEIGHT, BASE_HEIGHT, OTHER_HEIGHT
 
-    parser = argparse.ArgumentParser(description="Convert SVG city map to STL")
-    parser.add_argument("input",  help="Input SVG file")
-    parser.add_argument("output", nargs="?", default=None, help="Output STL file (default: <input>.stl)")
-    parser.add_argument("--road-buffer",     type=float, default=ROAD_BUFFER,     help="Road half-width in SVG units")
-    parser.add_argument("--building-height", type=float, default=BUILDING_HEIGHT, help="Building extrusion height")
-    parser.add_argument("--road-height",     type=float, default=ROAD_HEIGHT,     help="Road extrusion height")
-    parser.add_argument("--base-height",     type=float, default=BASE_HEIGHT,     help="Base plate thickness")
+    parser = argparse.ArgumentParser(description="SVG city map → STL")
+    parser.add_argument("input")
+    parser.add_argument("output", nargs="?", default=None)
+    parser.add_argument("--road-buffer",     type=float, default=ROAD_BUFFER)
+    parser.add_argument("--building-height", type=float, default=BUILDING_HEIGHT)
+    parser.add_argument("--road-height",     type=float, default=ROAD_HEIGHT)
+    parser.add_argument("--base-height",     type=float, default=BASE_HEIGHT)
     args = parser.parse_args()
 
     ROAD_BUFFER     = args.road_buffer
