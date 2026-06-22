@@ -233,6 +233,8 @@ def convert(svg_path: str, stl_path: str):
 
 
 def main():
+    global ROAD_BUFFER, BUILDING_HEIGHT, ROAD_HEIGHT, BASE_HEIGHT
+
     parser = argparse.ArgumentParser(description="Convert SVG city map to STL")
     parser.add_argument("input",  help="Input SVG file")
     parser.add_argument("output", nargs="?", default=None, help="Output STL file (default: <input>.stl)")
@@ -242,7 +244,6 @@ def main():
     parser.add_argument("--base-height",     type=float, default=BASE_HEIGHT,     help="Base plate thickness")
     args = parser.parse_args()
 
-    global ROAD_BUFFER, BUILDING_HEIGHT, ROAD_HEIGHT, BASE_HEIGHT
     ROAD_BUFFER     = args.road_buffer
     BUILDING_HEIGHT = args.building_height
     ROAD_HEIGHT     = args.road_height
